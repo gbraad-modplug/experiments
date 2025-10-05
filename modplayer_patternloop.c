@@ -2,7 +2,7 @@
 // Headless SDL2 + libopenmpt player:
 // - Channel mute/unmute (1–9, m, u)
 // - Pitch slider (+ / -)
-// - Pattern loop toggle (p) — loops the current order cleanly
+// - Pattern loop toggle (p) — loops current order cleanly at row boundaries
 // - Prints the played filename at startup
 // - Reads keys from stdin (no SDL window needed)
 
@@ -25,39 +25,34 @@ typedef struct {
     double pitch_factor;
     int num_channels;
     int *mute_states;
+
     int pattern_mode;   // 0 = song, 1 = pattern loop
-    int loop_pattern;   // pattern index to loop (for info)
-    int loop_order;     // order index to loop (used for position reset)
+    int loop_pattern;   // pattern index to loop
+    int loop_order;     // order index to loop
 } AudioData;
 
 static volatile int running = 1;
 
 // -------- terminal (stdin) helpers --------
 static struct termios orig_termios;
-
 static void tty_restore(void) {
     if (orig_termios.c_cflag) {
         tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
     }
 }
-
 static int tty_make_raw_nonblocking(void) {
-    if (!isatty(STDIN_FILENO)) {
-        fprintf(stderr, "stdin is not a TTY; key input may not work.\n");
-        return -1;
-    }
-    if (tcgetattr(STDIN_FILENO, &orig_termios) < 0) { perror("tcgetattr"); return -1; }
+    if (!isatty(STDIN_FILENO)) return -1;
+    if (tcgetattr(STDIN_FILENO, &orig_termios) < 0) return -1;
     struct termios raw = orig_termios;
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) < 0) { perror("tcsetattr"); return -1; }
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     if (flags != -1) fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
     atexit(tty_restore);
     return 0;
 }
-
 static int read_key_nonblocking(void) {
     unsigned char c;
     ssize_t n = read(STDIN_FILENO, &c, 1);
@@ -66,10 +61,7 @@ static int read_key_nonblocking(void) {
 }
 
 // -------- signal handling --------
-static void handle_sigint(int sig) {
-    (void)sig;
-    running = 0;
-}
+static void handle_sigint(int sig) { (void)sig; running = 0; }
 
 // -------- SDL audio callback --------
 static void audio_callback(void *userdata, Uint8 *stream, int len) {
@@ -77,25 +69,12 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
     int16_t *buffer = (int16_t *)stream;
     int frames = len / (2 * sizeof(int16_t));
 
-    // PRE-RENDER loop enforcement to avoid off-by-one double-hit
-    if (data->pattern_mode) {
-        int cur_order = openmpt_module_get_current_order(data->mod);
-        int cur_row   = openmpt_module_get_current_row(data->mod);
-        int rows_in_loop_pattern = openmpt_module_get_pattern_num_rows(data->mod, data->loop_pattern);
-
-        // If we left the loop order, or we are at/after the last row, jump back now
-        if (cur_order != data->loop_order || cur_row >= (rows_in_loop_pattern - 1)) {
-            openmpt_module_set_position_order_row(data->mod, data->loop_order, 0);
-        }
-    }
-
     int count = openmpt_module_read_interleaved_stereo(
         data->mod,
         data->samplerate * data->pitch_factor,
         frames,
         buffer
     );
-
     if (count == 0) {
         SDL_memset(stream, 0, len);
     }
@@ -123,30 +102,19 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s file.mod\n", argv[0]);
         return 1;
     }
-
     printf("Now playing: %s\n", argv[1]);
 
-    // Load module file
+    // Load module
     size_t bytes_size = 0;
     void *bytes = load_file(argv[1], &bytes_size);
     if (!bytes) return 1;
-
     int error = 0;
     openmpt_module_ext *modext = openmpt_module_ext_create_from_memory(
-        bytes, bytes_size,
-        NULL, NULL, NULL, &error,
-        NULL, NULL, NULL);
+        bytes, bytes_size, NULL, NULL, NULL, &error, NULL, NULL, NULL);
     free(bytes);
-    if (!modext) {
-        fprintf(stderr, "Error loading module (code %d)\n", error);
-        return 1;
-    }
+    if (!modext) { fprintf(stderr, "Error loading module (%d)\n", error); return 1; }
     openmpt_module *mod = openmpt_module_ext_get_module(modext);
-    if (!mod) {
-        fprintf(stderr, "Failed to get base module\n");
-        openmpt_module_ext_destroy(modext);
-        return 1;
-    }
+    if (!mod) { fprintf(stderr, "Failed to get base module\n"); openmpt_module_ext_destroy(modext); return 1; }
 
     AudioData ad;
     ad.modext = modext;
@@ -167,12 +135,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (openmpt_module_ext_get_interface(
-            modext,
-            LIBOPENMPT_EXT_C_INTERFACE_INTERACTIVE,
-            &ad.interactive,
-            sizeof(ad.interactive)) != 0) {
+            modext, LIBOPENMPT_EXT_C_INTERFACE_INTERACTIVE,
+            &ad.interactive, sizeof(ad.interactive)) != 0) {
         ad.interactive_ok = 1;
-        fprintf(stderr, "Interactive extension loaded successfully.\n");
+        fprintf(stderr, "Interactive extension loaded.\n");
     } else {
         fprintf(stderr, "Interactive extension not available.\n");
     }
@@ -183,16 +149,14 @@ int main(int argc, char *argv[]) {
         openmpt_module_ext_destroy(modext);
         return 1;
     }
-
     SDL_AudioSpec spec;
     SDL_zero(spec);
     spec.freq = (int)ad.samplerate;
     spec.format = AUDIO_S16SYS;
     spec.channels = 2;
-    spec.samples = 1024;
+    spec.samples = 512;
     spec.callback = audio_callback;
     spec.userdata = &ad;
-
     if (SDL_OpenAudio(&spec, NULL) < 0) {
         fprintf(stderr, "SDL_OpenAudio failed: %s\n", SDL_GetError());
         free(ad.mute_states);
@@ -223,8 +187,6 @@ int main(int argc, char *argv[]) {
                         ad.mute_states[ch] ? 0.0 : 1.0);
                     printf("Channel %d %s\n", ch + 1,
                            ad.mute_states[ch] ? "muted" : "unmuted");
-                } else {
-                    printf("Channel %d out of range (num_channels=%d)\n", ch + 1, ad.num_channels);
                 }
             } else if (ad.interactive_ok && (k == 'm' || k == 'M')) {
                 for (int ch = 0; ch < ad.num_channels; ++ch) {
@@ -251,13 +213,28 @@ int main(int argc, char *argv[]) {
                     ad.loop_pattern = openmpt_module_get_current_pattern(ad.mod);
                     printf("Pattern mode ON (looping pattern %d at order %d)\n",
                            ad.loop_pattern, ad.loop_order);
-                    // Start from beginning
                     openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
                 } else {
                     printf("Song mode ON\n");
                 }
             }
         }
+
+        // Pattern loop enforcement at row boundary
+        if (ad.pattern_mode) {
+            int cur_order = openmpt_module_get_current_order(ad.mod);
+            int cur_row   = openmpt_module_get_current_row(ad.mod);
+            int rows      = openmpt_module_get_pattern_num_rows(ad.mod, ad.loop_pattern);
+
+            if (cur_order == ad.loop_order && cur_row == rows - 1) {
+                // Jump back after finishing last row of the looped order
+                openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
+            } else if (cur_order != ad.loop_order) {
+                // If progression escaped the loop order for any reason, snap back
+                openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
+            }
+        }
+
         SDL_Delay(10);
     }
 
