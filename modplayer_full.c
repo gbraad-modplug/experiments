@@ -22,6 +22,8 @@ typedef struct {
     int loop_pattern;   // pattern index to loop
     int loop_order;     // order index to loop
     int paused;         // 0 = playing, 1 = paused
+
+    int do_pattern_loop; // flag for deferred pattern loop
 } AudioData;
 
 static volatile int running = 1;
@@ -61,6 +63,15 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
     AudioData *data = (AudioData *)userdata;
     int16_t *buffer = (int16_t *)stream;
     int frames = len / (2 * sizeof(int16_t));
+
+    // Defer pattern loop jump until inside audio callback
+    if (data->do_pattern_loop) {
+        openmpt_module_set_position_order_row(data->mod, data->loop_order, 0);
+        if (data->interactive_ok)
+            reapply_mutes(data);
+        data->do_pattern_loop = 0;
+        // Optionally: printf("Looped back to Order %d (Pattern %d)\n", data->loop_order, data->loop_pattern);
+    }
 
     if (data->paused) {
         SDL_memset(stream, 0, len);
@@ -140,6 +151,7 @@ int main(int argc, char *argv[]) {
     ad.loop_pattern = 0;
     ad.loop_order = 0;
     ad.paused = 1;
+    ad.do_pattern_loop = 0;
 
     if (!ad.mute_states) {
         fprintf(stderr, "calloc failed\n");
@@ -189,6 +201,8 @@ int main(int argc, char *argv[]) {
 
     printf("\nPlayback paused (press SPACE to start)\n");
 
+    static int prev_row = -1;
+
     while (running) {
         int k = read_key_nonblocking();
         if (k != -1) {
@@ -237,29 +251,29 @@ int main(int argc, char *argv[]) {
                     ad.loop_pattern = openmpt_module_get_current_pattern(ad.mod);
                     printf("Pattern mode ON (looping pattern %d at order %d)\n",
                            ad.loop_pattern, ad.loop_order);
-                    // no immediate jump here
+                    prev_row = -1; // reset previous row tracker
                 } else {
                     printf("Song mode ON\n");
                 }
             }
         }
 
-        // Pattern loop enforcement at row boundary
+        // Pattern loop enforcement at row boundary, with wrap detection
         if (ad.pattern_mode) {
             int cur_order = openmpt_module_get_current_order(ad.mod);
             int cur_row   = openmpt_module_get_current_row(ad.mod);
             int rows      = openmpt_module_get_pattern_num_rows(ad.mod, ad.loop_pattern);
 
-            if (cur_order == ad.loop_order && cur_row == rows - 1) {
-                openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
-                reapply_mutes(&ad);
-                printf("Looped back to Order %d (Pattern %d)\n",
-                       ad.loop_order, ad.loop_pattern);
-            } else if (cur_order != ad.loop_order) {
-                openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
-                reapply_mutes(&ad);
-                printf("Corrected back to Order %d (Pattern %d)\n",
-                       ad.loop_order, ad.loop_pattern);
+            if (cur_order == ad.loop_order) {
+                if (prev_row == rows - 1 && cur_row == 0) {
+                    ad.do_pattern_loop = 1;
+                    // printf("Looped back to Order %d (Pattern %d)\n", ad.loop_order, ad.loop_pattern);
+                }
+                prev_row = cur_row;
+            } else {
+                ad.do_pattern_loop = 1;
+                // printf("Corrected back to Order %d (Pattern %d)\n", ad.loop_order, ad.loop_pattern);
+                prev_row = -1;
             }
         }
 
