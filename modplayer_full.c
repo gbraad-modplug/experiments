@@ -79,6 +79,14 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
 }
 
 // -------- utilities --------
+static void reapply_mutes(AudioData *ad) {
+    if (!ad->interactive_ok) return;
+    for (int ch = 0; ch < ad->num_channels; ++ch) {
+        ad->interactive.set_channel_volume(ad->modext, ch,
+            ad->mute_states[ch] ? 0.0 : 1.0);
+    }
+}
+
 static void *load_file(const char *path, size_t *out_size) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror("fopen"); return NULL; }
@@ -193,6 +201,7 @@ int main(int argc, char *argv[]) {
                 int cur_order = openmpt_module_get_current_order(ad.mod);
                 int cur_pat   = openmpt_module_get_current_pattern(ad.mod);
                 openmpt_module_set_position_order_row(ad.mod, cur_order, 0);
+                reapply_mutes(&ad);
                 printf("Retriggered Order %d (Pattern %d)\n", cur_order, cur_pat);
             } else if (ad.interactive_ok && k >= '1' && k <= '9') {
                 int ch = k - '1';
@@ -243,10 +252,12 @@ int main(int argc, char *argv[]) {
 
             if (cur_order == ad.loop_order && cur_row == rows - 1) {
                 openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
+                reapply_mutes(&ad);
                 printf("Looped back to Order %d (Pattern %d)\n",
                        ad.loop_order, ad.loop_pattern);
             } else if (cur_order != ad.loop_order) {
                 openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
+                reapply_mutes(&ad);
                 printf("Corrected back to Order %d (Pattern %d)\n",
                        ad.loop_order, ad.loop_pattern);
             }
