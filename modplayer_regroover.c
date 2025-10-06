@@ -52,6 +52,8 @@ typedef struct {
 
     int custom_loop_rows; // 0 means use full pattern length
     int full_loop_rows;   // current full pattern length for loop_order
+
+    int was_paused;
 } AudioData;
 
 static volatile int running = 1;
@@ -232,6 +234,7 @@ int main(int argc, char *argv[]) {
     ad.pending_pattern_mode_order = -1;
     ad.custom_loop_rows = 0;
     ad.full_loop_rows = 0;
+    ad.was_paused = 1;
 
     if (!ad.mute_states) {
         fprintf(stderr, "calloc failed\n");
@@ -245,6 +248,9 @@ int main(int argc, char *argv[]) {
         ad.interactive_ok = 1;
         fprintf(stderr, "Interactive extension loaded.\n");
     }
+
+    // For endless song mode looping, uncomment:
+    // openmpt_module_set_repeat_count(ad.mod, -1);
 
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -289,6 +295,16 @@ int main(int argc, char *argv[]) {
 
     static int prev_row = -1;
     while (running) {
+        // Resume retrigger logic: if just resumed, force retrigger to re-initialize OpenMPT state
+        if (ad.was_paused && !ad.paused) {
+            int cur_order = openmpt_module_get_current_order(ad.mod);
+            int cur_row = openmpt_module_get_current_row(ad.mod);
+            openmpt_module_set_position_order_row(ad.mod, cur_order, cur_row);
+            if (ad.interactive_ok) reapply_mutes(&ad);
+            printf("Resume: forced retrigger at Order %d, Row %d\n", cur_order, cur_row);
+        }
+        ad.was_paused = ad.paused;
+
         int k = read_key_nonblocking();
         if (k != -1) {
             if (k == 27 || k == 'q' || k == 'Q') {
