@@ -37,32 +37,31 @@ typedef struct {
     int loop_order;     // order index to loop
     int paused;         // 0 = playing, 1 = paused
 
-    // Command queue
     PlaybackCommand command_queue[MAX_COMMANDS];
     int command_queue_head;
     int command_queue_tail;
 
-    // For queued jumps (song mode)
     int queued_order;
     int queued_row;
     int has_queued_jump;
 
-    // For loop-till-row
     int loop_till_row;
     int is_looping_till;
 
-    // For pattern mode pending jump
     int pending_pattern_mode_order; // -1 = none
+
+    int custom_loop_rows; // 0 means use full pattern length
+    int full_loop_rows;   // current full pattern length for loop_order
 } AudioData;
 
 static volatile int running = 1;
 
-// Function prototypes
+// --- function prototypes ---
 static void reapply_mutes(AudioData *ad);
 static void enqueue_command(AudioData *ad, PlaybackCommandType type, int order, int row);
 static void process_commands(AudioData *ad);
 
-// -------- terminal (stdin) helpers --------
+// --- terminal (stdin) helpers ---
 static struct termios orig_termios;
 static void tty_restore(void) {
     if (orig_termios.c_cflag) {
@@ -89,10 +88,10 @@ static int read_key_nonblocking(void) {
     return -1;
 }
 
-// -------- signal handling --------
+// --- signal handling ---
 static void handle_sigint(int sig) { (void)sig; running = 0; }
 
-// -------- SDL audio callback --------
+// --- SDL audio callback ---
 static void audio_callback(void *userdata, Uint8 *stream, int len) {
     AudioData *data = (AudioData *)userdata;
     int16_t *buffer = (int16_t *)stream;
@@ -101,7 +100,6 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
     // Process playback commands before rendering audio
     process_commands(data);
 
-    // Handle queued jumps at row boundary (for song mode)
     if (data->has_queued_jump) {
         openmpt_module_set_position_order_row(data->mod, data->queued_order, data->queued_row);
         if (data->interactive_ok)
@@ -121,11 +119,12 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
         buffer
     );
     if (count == 0) {
+        printf("audio_callback: openmpt_module_read_interleaved_stereo returned 0! End of module or invalid state.\n");
         SDL_memset(stream, 0, len);
     }
 }
 
-// -------- utilities --------
+// --- utilities ---
 static void reapply_mutes(AudioData *ad) {
     if (!ad->interactive_ok) return;
     for (int ch = 0; ch < ad->num_channels; ++ch) {
@@ -149,7 +148,7 @@ static void *load_file(const char *path, size_t *out_size) {
 
 static void enqueue_command(AudioData *ad, PlaybackCommandType type, int order, int row) {
     int next_tail = (ad->command_queue_tail + 1) % MAX_COMMANDS;
-    if (next_tail != ad->command_queue_head) { // not full
+    if (next_tail != ad->command_queue_head) {
         ad->command_queue[ad->command_queue_tail].type = type;
         ad->command_queue[ad->command_queue_tail].order = order;
         ad->command_queue[ad->command_queue_tail].row = row;
@@ -163,7 +162,6 @@ static void process_commands(AudioData *ad) {
         switch (cmd->type) {
             case PLAYBACK_QUEUE_ORDER:
                 if (ad->pattern_mode) {
-                    // Always overwrite: last N/n or P/p wins, used on next wrap
                     ad->pending_pattern_mode_order = cmd->order;
                 } else {
                     ad->queued_order = cmd->order;
@@ -174,6 +172,8 @@ static void process_commands(AudioData *ad) {
             case PLAYBACK_LOOP_TILL_ROW:
                 ad->loop_order = cmd->order;
                 ad->loop_pattern = openmpt_module_get_order_pattern(ad->mod, cmd->order);
+                ad->full_loop_rows = openmpt_module_get_pattern_num_rows(ad->mod, ad->loop_pattern);
+                ad->custom_loop_rows = 0;
                 ad->loop_till_row = cmd->row;
                 ad->is_looping_till = 1;
                 openmpt_module_set_position_order_row(ad->mod, cmd->order, 0);
@@ -230,6 +230,8 @@ int main(int argc, char *argv[]) {
     ad.loop_till_row = 0;
     ad.is_looping_till = 0;
     ad.pending_pattern_mode_order = -1;
+    ad.custom_loop_rows = 0;
+    ad.full_loop_rows = 0;
 
     if (!ad.mute_states) {
         fprintf(stderr, "calloc failed\n");
@@ -276,6 +278,8 @@ int main(int argc, char *argv[]) {
     printf("  N/n queue next order (pattern) for after current pattern in pattern mode, or next jump in song mode\n");
     printf("  P/p queue previous order (pattern) for after current pattern in pattern mode, or previous jump in song mode\n");
     printf("  j loop current pattern from row 0 till the row you pressed j\n");
+    printf("  h halve loop length of pattern in pattern mode (keeps halving from current length, min 1)\n");
+    printf("  f reset loop length to full pattern\n");
     printf("  S or s toggle song/pattern mode\n");
     printf("  1–9 toggle channels, m=mute all, u=unmute all\n");
     printf("  +/- adjust pitch\n");
@@ -314,11 +318,23 @@ int main(int argc, char *argv[]) {
                 int cur_row = openmpt_module_get_current_row(ad.mod);
                 enqueue_command(&ad, PLAYBACK_LOOP_TILL_ROW, cur_order, cur_row);
                 printf("Loop till row queued: Order %d, Row %d\n", cur_order, cur_row);
+            } else if (k == 'h' || k == 'H') {
+                if (ad.pattern_mode) {
+                    int loop_rows = ad.custom_loop_rows > 0 ? ad.custom_loop_rows : ad.full_loop_rows;
+                    ad.custom_loop_rows = loop_rows / 2;
+                    if (ad.custom_loop_rows < 1) ad.custom_loop_rows = 1;
+                    printf("Loop length halved: %d rows\n", ad.custom_loop_rows);
+                }
+            } else if (k == 'f' || k == 'F') {
+                ad.custom_loop_rows = 0;
+                printf("Loop length reset to full pattern: %d rows\n", ad.full_loop_rows);
             } else if (k == 'S' || k == 's') {
                 ad.pattern_mode = !ad.pattern_mode;
                 if (ad.pattern_mode) {
                     ad.loop_order   = openmpt_module_get_current_order(ad.mod);
                     ad.loop_pattern = openmpt_module_get_current_pattern(ad.mod);
+                    ad.full_loop_rows = openmpt_module_get_pattern_num_rows(ad.mod, ad.loop_pattern);
+                    ad.custom_loop_rows = 0;
                     printf("Pattern mode ON (looping pattern %d at order %d)\n",
                            ad.loop_pattern, ad.loop_order);
                     ad.pending_pattern_mode_order = -1;
@@ -355,38 +371,45 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // --- Pattern mode: always loop pattern at current order, and switch if pending queued ---
         if (ad.pattern_mode && !ad.is_looping_till) {
             int cur_order = openmpt_module_get_current_order(ad.mod);
             int cur_row = openmpt_module_get_current_row(ad.mod);
-            int rows = openmpt_module_get_pattern_num_rows(ad.mod, ad.loop_pattern);
+            int loop_rows = ad.custom_loop_rows > 0 ? ad.custom_loop_rows : ad.full_loop_rows;
 
-            // Detect wrap: always check pending order
-            if (prev_row == rows - 1 && cur_row == 0) {
+            // Always trigger at the custom loop boundary for custom loops
+            if (ad.custom_loop_rows > 0 && cur_row >= loop_rows) {
+                openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
+                if (ad.interactive_ok) reapply_mutes(&ad);
+                printf("Pattern mode: looping pattern %d at order %d (length: %d rows)\n",
+                       ad.loop_pattern, ad.loop_order, loop_rows);
+            }
+            // Full pattern wrap or pending pattern order
+            else if (ad.custom_loop_rows == 0 && prev_row == loop_rows - 1 && cur_row == 0) {
                 if (ad.pending_pattern_mode_order != -1 && ad.pending_pattern_mode_order != ad.loop_order) {
                     ad.loop_order = ad.pending_pattern_mode_order;
                     ad.loop_pattern = openmpt_module_get_order_pattern(ad.mod, ad.loop_order);
+                    ad.full_loop_rows = openmpt_module_get_pattern_num_rows(ad.mod, ad.loop_pattern);
+                    ad.custom_loop_rows = 0;
                     openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
                     if (ad.interactive_ok) reapply_mutes(&ad);
                     printf("Pattern mode: jumping to and looping pattern %d at order %d\n",
                            ad.loop_pattern, ad.loop_order);
-                    ad.pending_pattern_mode_order = -1; // clear after jump
+                    ad.pending_pattern_mode_order = -1;
                 } else {
                     openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
                     if (ad.interactive_ok) reapply_mutes(&ad);
-                    printf("Pattern mode: looping pattern %d at order %d\n", ad.loop_pattern, ad.loop_order);
+                    printf("Pattern mode: looping pattern %d at order %d (length: %d rows)\n",
+                        ad.loop_pattern, ad.loop_order, loop_rows);
                 }
             }
             prev_row = cur_row;
 
-            // Snap back if we left the loop order
             if (cur_order != ad.loop_order) {
                 openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
                 if (ad.interactive_ok) reapply_mutes(&ad);
                 prev_row = -1;
             }
         }
-        // --- Loop-till-row logic ---
         else if (ad.is_looping_till) {
             int cur_order = openmpt_module_get_current_order(ad.mod);
             int cur_row = openmpt_module_get_current_row(ad.mod);
@@ -394,7 +417,7 @@ int main(int argc, char *argv[]) {
 
             if (cur_order == ad.loop_order) {
                 if (cur_row == ad.loop_till_row) {
-                    ad.is_looping_till = 0; // stop looping, resume normal playback
+                    ad.is_looping_till = 0;
                     printf("Loop-till-row finished at Order %d, Row %d\n", cur_order, cur_row);
                 } else if (prev_row == rows - 1 && cur_row == 0) {
                     openmpt_module_set_position_order_row(ad.mod, ad.loop_order, 0);
